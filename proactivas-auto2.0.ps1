@@ -1924,34 +1924,22 @@ function performanceHealthCheck {
 }
 
 function alarmCheck {
-    # 1. Importar datos (SOLO DEL ARCHIVO MÁS RECIENTE)
-    # Buscamos el .xlsx más nuevo en la carpeta para evitar sumar reportes viejos
-    $archivoMasNuevo = Get-ChildItem -Path $rutaArchivos -Filter *.xlsx | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    
-    if (-not $archivoMasNuevo) {
-        return [PSCustomObject]@{
-            ID        = "VSP-ME-13" 
-            Resultado = "Sin acceso"
-            Detalle   = "No se encontraron archivos Excel de reporte en la ruta indicada."
+    # 1. Importar datos
+    # Usamos la misma lógica que en performanceHealthCheck que confirmaste que funciona
+    $todosLosDatos = Get-ChildItem -Path $excelMasReciente -Filter *.xlsx | ForEach-Object {
+        try { 
+            Import-Excel -Path $_.FullName -WorksheetName "Falso Positivo" -ErrorAction Stop 
+        } catch { 
+            # Si la hoja no existe en un excel viejo, lo ignoramos
         }
-    }
+    } | Where-Object { -not [string]::IsNullOrEmpty($_.vCenter) }
 
-    # Intentamos leer la hoja
-    $todosLosDatos = try { 
-        Import-Excel -Path $archivoMasNuevo.FullName -WorksheetName "Falso Positivo" -ErrorAction Stop 
-    } catch { $null }
-    
-    # Filtramos filas vacías
-    if ($todosLosDatos) {
-        $todosLosDatos = $todosLosDatos | Where-Object { -not [string]::IsNullOrEmpty($_.vCenter) }
-    }
-
-    # --- CONDICIÓN GLOBAL: HOJA VACÍA ---
+    # --- CONDICIÓN GLOBAL: SIN ACCESO (Si no se trajo nada de ningún lado) ---
     if (-not $todosLosDatos -or $todosLosDatos.Count -eq 0) {
         return [PSCustomObject]@{
             ID        = "VSP-ME-13" 
             Resultado = "Sin acceso"
-            Detalle   = "No se encontraron registros de la prueba de alarmas en el archivo '$($archivoMasNuevo.Name)'."
+            Detalle   = "No se encontraron registros de la prueba de alarmas (hoja vacía o no encontrada)."
         }
     }
 
@@ -1963,21 +1951,23 @@ function alarmCheck {
 
     # 2. Procesar cada fila
     foreach ($fila in $todosLosDatos) {
+        # Limpieza y Normalización
         $resultado = if ($fila.Result) { $fila.Result.ToString().Trim() } else { "" }
         
-        # Normalizamos nombres
         $nombreAlarma = if ($fila."Alarm Name") { $fila."Alarm Name" } else { $fila."Alarm Source" }
-        $rutaScript   = if ($fila."Script Path") { $fila."Script Path" } else { $fila."Alarm Path" }
+        
+        $rutaScript = if ($fila."Script Path") { $fila."Script Path" } else { $fila."Alarm Path" }
         if (-not $rutaScript) { $rutaScript = $fila."Path Alarma" }
 
         $esHallazgo = $false
         $diagnostico = ""
 
         # --- VALIDACIÓN DE ÉXITO ---
+        # Aceptamos OK, SUCCESS, o mensajes compuestos que empiezan con SUCCESS
         if ($resultado -eq "OK" -or $resultado -match "^SUCCESS") {
             $countExitos++
 
-            # Análisis de Tokens (Solo en éxitos)
+            # Análisis de Tokens (Solo en los exitosos)
             if (-not [string]::IsNullOrEmpty($rutaScript) -and $rutaScript -ne "N/A") {
                 $partes = $rutaScript -split "\s+"
                 if ($partes.Count -gt 1) {
@@ -1995,11 +1985,11 @@ function alarmCheck {
             switch -Wildcard ($resultado) {
                 "*No Script Configured*" { 
                     $diagnostico = "Configuración: Alarma sin acción de script"
-                    if ("Alarmas sin configurar" -notin $causas) { $causas += "Alarmas sin configurar" }
+                    if ("Configuración incompleta" -notin $causas) { $causas += "Configuración incompleta" }
                 }
                 "*Script Action Empty*" { 
                     $diagnostico = "Configuración: Acción de script vacía"
-                    if ("Alarmas sin configurar" -notin $causas) { $causas += "Alarmas sin configurar" }
+                    if ("Configuración incompleta" -notin $causas) { $causas += "Configuración incompleta" }
                 }
                 "*Not Found*" { 
                     $diagnostico = "Alarma no encontrada en vCenter"
@@ -2021,13 +2011,13 @@ function alarmCheck {
 
             # Guardar en Anexo
             $informeFinal += [PSCustomObject]@{
-                "vCenter"     = $fila.vCenter
-                "Host"        = $fila.Host
-                "Alarma"      = $nombreAlarma
-                "Script Path" = $rutaScript
-                "Resultado"   = $resultado
-                "Diagnóstico" = $diagnostico
-                "Timestamp"   = $fila.Timestamp
+                "vCenter"       = $fila.vCenter
+                "Host"          = $fila.Host
+                "Alarma"        = $nombreAlarma
+                "Script Path"   = $rutaScript
+                "Resultado"     = $resultado
+                "Diagnóstico"   = $diagnostico
+                "Timestamp"     = $fila.Timestamp
             }
         }
     }
@@ -2042,8 +2032,8 @@ function alarmCheck {
     
     if ($tokensUnicos.Count -gt 1) {
         $notaInconsistencia = " (Nota: Se detectaron $($tokensUnicos.Count) variantes de tokens/argumentos)."
-        # Agregamos la nota al detalle de éxito también
-        $detalleChecklist += $notaInconsistencia
+        # Si quieres agregar la nota al detalle de éxito:
+        if ($countFallas -eq 0) { $detalleChecklist += $notaInconsistencia }
     }
 
     if ($countFallas -gt 0) {
