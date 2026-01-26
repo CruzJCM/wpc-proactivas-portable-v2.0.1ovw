@@ -1,4 +1,6 @@
-# --- Tus rutas definidas (no se cambian) ---
+#Author: Santiago Alvarez
+#Githb: SanntAlv
+
 $baseDir = $PSScriptRoot #portable
 $directorioReportesJson = Join-Path -Path $baseDir -ChildPath "devops-powershell\reportes" 
 $directorioExcelFinal   = Join-Path -Path $baseDir -ChildPath "devops-powershell\reportes\proactiva-excel"
