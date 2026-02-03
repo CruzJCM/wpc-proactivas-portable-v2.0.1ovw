@@ -23,45 +23,43 @@ function Get-DatosVeeam($connections) {
 
 
 function Start-DatosVeeam($connections) {
-    # Validación básica de que Veeam está activo
+    # Validacion: Verificar si Veeam fue seleccionado en el menu
     $veeamConn = $connections | Where-Object { $_.component -eq "veeam" }
     if (-not $veeamConn -or -not $veeamConn.conn) { return }
 
-    Write-Host "-> Iniciando Recolección de Veeam..." -ForegroundColor Cyan
+    Write-Host "-> Iniciando Recoleccion de Veeam..." -ForegroundColor Cyan
 
     # -------------------------------------------------------------------------
-    # 1. RESOLUCIÓN DE RUTAS (MÉTODO SEGURO)
+    # 1. RESOLUCION DE RUTAS (Metodo Seguro usando Config Global)
     # -------------------------------------------------------------------------
-    # Usamos las variables de configuración del framework para no fallar
-    
-    # Ruta del script puente (dentro de la carpeta de plugins/lib)
+    # Usamos las variables del framework para no fallar con rutas relativas
     $bridgePath = Join-Path $global:CONFIG.PLUGINS_FOLDER "lib\VeeamBridge.ps1"
-    
-    # Ruta de reportes
     $reportsDir = $global:CONFIG.REPORTS_FOLDER
     
-    # Ruta de resultado.txt (Asumimos que está un nivel arriba de donde corre el script base)
-    # devops.ps1 corre en /devops-powershell/, así que resultado.txt está en ../
-    $resultTxtPath = "..\resultado.txt"
+    # El archivo resultado.txt esta en la raiz, un nivel arriba de devops.ps1
+    # Calculamos la ruta absoluta para evitar errores de contexto
+    $baseDir = (Get-Item $global:CONFIG.PLUGINS_FOLDER).Parent.Parent.FullName
+    $resultTxtPath = Join-Path $baseDir "resultado.txt"
 
-    # Convertimos a rutas absolutas para que Start-Process no se confunda
+    # Convertimos rutas a absolutas para Start-Process
     $fullBridgePath = (Get-Item -Path $bridgePath -ErrorAction SilentlyContinue).FullName
     $fullReportsDir = (Get-Item -Path $reportsDir -ErrorAction SilentlyContinue).FullName
 
-    # --- VALIDACIÓN DE SEGURIDAD ---
+    # Validacion de seguridad
     if (-not $fullBridgePath -or -not (Test-Path $fullBridgePath)) {
-        Write-Error "CRÍTICO: No se encuentra el script puente en: $bridgePath"
-        return # Aquí es donde probablemente fallaba antes
+        Write-Error "CRITICO: No se encuentra el script puente en: $bridgePath"
+        return
     }
 
     # -------------------------------------------------------------------------
-    # 2. CAPTURA DE ESTADO INICIAL
+    # 2. CAPTURA INICIAL (Para detectar cambios)
     # -------------------------------------------------------------------------
     $existingFiles = @(Get-ChildItem -Path $fullReportsDir -Filter "VeeamBridge_*.json" -ErrorAction SilentlyContinue)
 
     # -------------------------------------------------------------------------
-    # 3. LANZAR PUENTE (Ventana Azul)
+    # 3. EJECUCION DEL PUENTE (Tu Clase VeeamProactiva)
     # -------------------------------------------------------------------------
+    # Intentamos usar PowerShell de 64-bits si estamos en un entorno de 32
     $psExe = "powershell.exe"
     $sysNative = "$env:windir\SysNative\WindowsPowerShell\v1.0\powershell.exe"
     if (Test-Path $sysNative) { $psExe = $sysNative }
@@ -69,14 +67,14 @@ function Start-DatosVeeam($connections) {
     $processArgs = @(
         "-ExecutionPolicy", "Bypass",
         "-NoProfile",
-        "-NoExit", # Mantener abierto para debug (el script cierra con ENTER)
+        "-NoExit", # Se mantiene abierta para ver errores (Tu clase la cierra con ENTER al final)
         "-File", "`"$fullBridgePath`""
     )
 
     try {
         Write-Host "   [LANZANDO] Abriendo consola nativa..." -ForegroundColor Cyan
         $p = Start-Process $psExe -ArgumentList $processArgs -PassThru
-        $p.WaitForExit() 
+        $p.WaitForExit() # El script portable espera aqui
         Write-Host "   [FIN] Retornando al flujo principal." -ForegroundColor Green
     } catch {
         Write-Error "Fallo al iniciar puente: $($_.Exception.Message)"
@@ -84,9 +82,9 @@ function Start-DatosVeeam($connections) {
     }
 
     # -------------------------------------------------------------------------
-    # 4. REGISTRAR RESULTADO
+    # 4. REGISTRO (Logica de DatosProactiva)
     # -------------------------------------------------------------------------
-    # Buscamos archivos nuevos
+    # Buscamos archivos nuevos que no estaban en la captura inicial
     $currentFiles = @(Get-ChildItem -Path $fullReportsDir -Filter "VeeamBridge_*.json" -ErrorAction SilentlyContinue)
     
     $newFile = $currentFiles | Where-Object { 
@@ -95,17 +93,19 @@ function Start-DatosVeeam($connections) {
     } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 
     if ($newFile) {
-        Write-Host "   [DETECTADO] Reporte generado: $($newFile.Name)" -ForegroundColor Green
+        Write-Host "   [DETECTADO] Nuevo reporte generado: $($newFile.Name)" -ForegroundColor Green
         
         try {
-            # Escribir en resultado.txt
+            # Escribimos SOLO el nombre del archivo en resultado.txt
             if (-not (Test-Path $resultTxtPath)) { New-Item $resultTxtPath -ItemType File -Force | Out-Null }
+            
             Add-Content -Path $resultTxtPath -Value $newFile.Name -Force
+            
             Write-Host "   [REGISTRADO] Agregado a resultado.txt correctamente." -ForegroundColor Green
         } catch {
-            Write-Error "Error escribiendo resultado.txt: $($_.Exception.Message)"
+            Write-Error "Error escribiendo en resultado.txt: $($_.Exception.Message)"
         }
     } else {
-        Write-Warning "No se generó ningún JSON nuevo."
+        Write-Warning "No se genero ningun JSON nuevo. Revise la ventana azul por errores."
     }
 }
