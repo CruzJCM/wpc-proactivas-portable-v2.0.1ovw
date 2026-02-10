@@ -16,7 +16,7 @@ $mes = Read-Host "Escriba el mes correspondiente a la tarea Proactiva (ej: Enero
 
 $rutaArchivos = Join-Path -Path $baseDir -ChildPath "devops-powershell\reportes\proactiva-excel"    
 $archivoSalida = "${baseDir}\devops-powershell\reportes\Anexo\Anexo Tecnico - ${nombreCliente} - ${mes}.xlsx"
-$rutaSalidaChecklist = "${baseDir}\devops-powershell\reportes\Anexo\Checklist - ${nombreCliente} - ${mes}.xlsx"
+$rutaSalidaChecklist = "${baseDir}\devops-powershell\reportes\Anexo\Checklist Proactiva - ${nombreCliente} - ${mes}.xlsx"
 $rutaPlantilla = "${baseDir}\devops-powershell\reportes\templete\Checklist Proactiva Actualizada - Cliente - Mes.xlsx"
 
 

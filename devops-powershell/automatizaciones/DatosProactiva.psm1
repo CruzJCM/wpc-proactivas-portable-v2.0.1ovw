@@ -55,6 +55,7 @@ function Start-DatosProactivas($vcenters){
 
         Write-Host "`tBatch collection finished. Processing reports..."
         $proactiva.processAlarmCheck($hosts, $vcenter)
+        $proactiva.processVcenterSizing($allVms, $hosts) 
         $proactiva.processBackupActivity()
         $proactiva.processPerformanceHealth($clusters)
         $proactiva.processCertificates()
@@ -67,7 +68,6 @@ function Start-DatosProactivas($vcenters){
         $proactiva.processKernelAdapters($hosts)
         $proactiva.processSnapshot($allSnapshots) 
         $proactiva.processPartitions($allVms) 
-        $proactiva.processVcenterSizing($allVms, $hosts) 
         $proactiva.processvDS($vdswitches)
         $proactiva.processLicense()
     }

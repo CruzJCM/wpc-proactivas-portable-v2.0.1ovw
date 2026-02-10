@@ -13,6 +13,7 @@ Import-Module $CURRENT_FOLDER/plugins.psm1
 Import-Module $CURRENT_FOLDER/connections.psm1
 Import-Module $CURRENT_FOLDER/Module/VMware.Sdk.vSphere.Appliance.Recover
 Import-Module $CURRENT_FOLDER/Module/VMware.Sdk.vSphere
+Import-Module Veeam.Backup.PowerShell
 
 
 

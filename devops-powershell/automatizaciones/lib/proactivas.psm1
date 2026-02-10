@@ -38,6 +38,10 @@ class Proactiva {
 
     processEsxi($hosts) {
         Write-Host "`tProcessing ESXi..." -NoNewline
+        
+        # [CONTEXTO] Capturamos el servidor actual para usarlo en comandos críticos
+        $serverContext = $this.currentVCenter
+
         for ($count = 0; $count -lt $hosts.length; $count++) {
             Show-Progress $hosts.length ($count + 1)
             $h = $hosts[$count]
@@ -85,34 +89,38 @@ class Proactiva {
                 $certIssuer = ""
                 
                 try {
-                    # 1. Obtenemos el CertificateManager del Host usando Get-View (Como en el script que encontraste)
-                    $certMgr = Get-View -Id $h.ExtensionData.ConfigManager.CertificateManager -ErrorAction Stop
-                    
-                    # 2. Leemos la propiedad CertificateInfo
-                    if ($certMgr.CertificateInfo) {
-                        $certInfo = $certMgr.CertificateInfo
+                    # --- [CORRECCIÓN] Usamos -Server para asegurar que buscamos en el vCenter correcto ---
+                    # También validamos que el host tenga un CertificateManager antes de consultar
+                    if ($h.ExtensionData.ConfigManager.CertificateManager) {
+                        $certMgr = Get-View -Id $h.ExtensionData.ConfigManager.CertificateManager -Server $serverContext -ErrorAction Stop
                         
-                        # 3. Extraemos la fecha (NotAfter) y el Emisor
-                        $certValidToDate = $certInfo.NotAfter
-                        $certValidTo = Get-Date $certValidToDate -Format "yyyy-MM-dd"
-                        $certIssuer = $certInfo.Issuer
-                        
-                        # 4. Calculamos el Status
-                        $hoy = Get-Date
-                        if ($hoy -gt $certValidToDate) {
-                            $certStatus = "Expired"
-                        } elseif ($hoy.AddMonths(1) -gt $certValidToDate) {
-                            $certStatus = "Expiration imminent"
-                        } elseif ($hoy.AddMonths(2) -gt $certValidToDate) {
-                            $certStatus = "Expiration shortly"
-                        } elseif ($hoy.AddMonths(8) -gt $certValidToDate) {
-                            $certStatus = "Expiration soon"
-                        } else {
-                            $certStatus = "Valid"
+                        if ($certMgr.CertificateInfo) {
+                            $certInfo = $certMgr.CertificateInfo
+                            
+                            $certValidToDate = $certInfo.NotAfter
+                            $certValidTo = Get-Date $certValidToDate -Format "yyyy-MM-dd"
+                            $certIssuer = $certInfo.Issuer
+                            
+                            $hoy = Get-Date
+                            if ($hoy -gt $certValidToDate) {
+                                $certStatus = "Expired"
+                            } elseif ($hoy.AddMonths(1) -gt $certValidToDate) {
+                                $certStatus = "Expiration imminent"
+                            } elseif ($hoy.AddMonths(2) -gt $certValidToDate) {
+                                $certStatus = "Expiration shortly"
+                            } elseif ($hoy.AddMonths(8) -gt $certValidToDate) {
+                                $certStatus = "Expiration soon"
+                            } else {
+                                $certStatus = "Valid"
+                            }
                         }
                     }
                 }
-                catch {}
+                catch {
+                    # Opcional: Descomentar para debug si sigue fallando
+                    # Write-Warning "Fallo certificado host $($h.Name): $($_.Exception.Message)"
+                }
+
                 $hostModel = $hclResult.Model
                 $supported = if ($hclResult.Supported) { "True" } else { "False" }
                 $supportedReleases = $hclResult.SupportedReleases -join ","
@@ -139,7 +147,7 @@ class Proactiva {
             }
 
             $this.esxiReport += [PSCustomObject] @{
-                vCenter                     = $this.currentVCenter
+                vCenter                     = $this.currentVCenter # Usamos el nombre del objeto
                 Hostname                    = $h.Name
                 Model                       = $hostModel
                 Datacenter                  = ($h | Get-Datacenter).Name
@@ -484,32 +492,102 @@ class Proactiva {
             }
         }
     }
+    
     processVcenterSizing($vms, $hosts) {
-        Write-Host "`tProcessing Sizing...";
-        foreach ($vm in $vms) {
-            if ($vm.ExtensionData.Config.Annotation -in $this.annotations) {
-                for ($i = $this.vCenterSizing.vsphere.Count - 1; $i -ge 0; $i--) {
-                    if (($vm.NumCpu -ge $this.vCenterSizing.vsphere[$i].vcpus) -and ($vm.MemoryGB -ge $this.vCenterSizing.vsphere[$i].ram)) {
-                        $this.sizingReport += [PSCustomObject]@{
-                            vCenter             = $this.currentVCenter;
-                            VM                  = $vm.name;
-                            Annotation          = $vm.ExtensionData.Config.Annotation;
-                            vCPU                = $vm.NumCpu;
-                            "Memory GB"         = $vm.MemoryGB;
-                            "Cantidad de VMs"   = $vms.Count;
-                            "Cantidad de Hosts" = $hosts.length;
-                            "Sizing actual"     = $this.vCenterSizing.vsphere[$i].ToString
-                        }
-                    }
-                }
+        Write-Host "`tProcessing Sizing..." -NoNewline
+        
+        # --- Extracción robusta del nombre del vCenter ---
+        $rawVCenter = $this.currentVCenter
+        $vcenterName = if ($rawVCenter.Name) { $rawVCenter.Name } else { $rawVCenter }
+        
+        if ([string]::IsNullOrEmpty($vcenterName)) {
+            Write-Warning " -> Error: No se pudo determinar el nombre del vCenter."
+            return
+        }
+        
+        # 1. BÚSQUEDA DE VM (Lógica Robusta)
+        $vcenterShortName = ($vcenterName).Split('.')[0]
+        
+        $targetVM = $vms | Where-Object { 
+            $_.Name -eq $vcenterName -or 
+            $_.Name -eq $vcenterShortName 
+        } | Select-Object -First 1
+
+        # Fallback: Intentar por Annotation
+        if (-not $targetVM) {
+            $targetVM = $vms | Where-Object { $_.ExtensionData.Config.Annotation -in $this.annotations } | Select-Object -First 1
+        }
+
+        # Si no aparece, reportamos "No detectado"
+        if (-not $targetVM) {
+            $this.sizingReport += [PSCustomObject]@{
+                vCenter             = $vcenterName
+                VM                  = "No encontrada"
+                Annotation          = "-"
+                vCPU                = "-"
+                "Memory GB"         = "-"
+                "Cantidad de VMs"   = $vms.Count
+                "Cantidad de Hosts" = $hosts.Count
+                "Sizing actual"     = "Unknown (VM not found)"
             }
-        } 
+            return
+        }
+
+        # 2. MATCHING DE SIZING
+        $sizingFound = $false
+        
+        for ($i = $this.vCenterSizing.vsphere.Count - 1; $i -ge 0; $i--) {
+            $ref = $this.vCenterSizing.vsphere[$i]
+            
+            # --- [CORRECCIÓN] Volvemos a la lógica original para el nombre ---
+            # Usamos la propiedad .ToString tal cual estaba en tu código viejo
+            $refName = $ref.ToString
+            
+            # (Fallback de seguridad por si acaso la propiedad no existe, para no dejar vacío)
+            if (-not $refName) { $refName = if ($ref.size) { $ref.size } else { $ref.name } }
+
+            $refCpu = $ref.vcpus
+            $refRam = $ref.ram
+
+            # Comparación (Mayor o Igual)
+            if (($targetVM.NumCpu -ge $refCpu) -and ($targetVM.MemoryGB -ge $refRam)) {
+                
+                $this.sizingReport += [PSCustomObject]@{
+                    vCenter             = $vcenterName
+                    VM                  = $targetVM.Name
+                    Annotation          = if ($targetVM.ExtensionData.Config.Annotation) { $targetVM.ExtensionData.Config.Annotation } else { "-" }
+                    vCPU                = $targetVM.NumCpu
+                    "Memory GB"         = [math]::Round($targetVM.MemoryGB, 0)
+                    "Cantidad de VMs"   = $vms.Count
+                    "Cantidad de Hosts" = $hosts.Count
+                    "Sizing actual"     = $refName
+                }
+                
+                $sizingFound = $true
+                break # Encontrado el perfil más alto que cumple, salimos.
+            }
+        }
+
+        # 3. CASO CUSTOM
+        if (-not $sizingFound) {
+            $this.sizingReport += [PSCustomObject]@{
+                vCenter             = $vcenterName
+                VM                  = $targetVM.Name
+                Annotation          = if ($targetVM.ExtensionData.Config.Annotation) { $targetVM.ExtensionData.Config.Annotation } else { "-" }
+                vCPU                = $targetVM.NumCpu
+                "Memory GB"         = [math]::Round($targetVM.MemoryGB, 0)
+                "Cantidad de VMs"   = $vms.Count
+                "Cantidad de Hosts" = $hosts.Count
+                "Sizing actual"     = "Custom / Undefined"
+            }
+        }
+        
+        Write-Host " -> OK." -ForegroundColor Green
     }
 
     processvDS($vdswitches) {
         Write-Host "`tProcessing vDS (and Backup)..." -NoNewline;
         
-        # 1. Definimos la ruta de la carpeta de backups
         $backupPath = Join-Path -Path $global:CONFIG.REPORTS_FOLDER -ChildPath "vds_configuration"
 
         # 2. Verificamos si existe. Si no, la creamos.
@@ -553,135 +631,257 @@ class Proactiva {
         Write-Host " -> OK." -ForegroundColor Green
     }
     
+
     processAlarmCheck($hosts, $vcenterConnection) {
-        Write-Host "`tProcessing Alarm Check (Extraction & Test)..." -NoNewline
+        Write-Host "`tProcessing Alarm Check (Datastore Target)..." -NoNewline
+        
         $serverContext = $this.currentVCenter
         $vcenterName = $vcenterConnection.Name
         
         $uniqueId = (Get-Date).ToString("yyyyMMdd_HHmmss")
-        $alarmName = "Falso Positivo $($serverContext.Name) $uniqueId "
-        $sourceAlarmName = "Host Battery Status"
+        $alarmName = "Falso Positivo DS $uniqueId"
+        $sourceAlarmName = "Host connection failure"
         $scriptPath = $null
-        $reportResult = "Pendiente" # Variable para guardar el resultado final
+        $reportResult = "Pendiente"
 
-        $targetHost = $hosts | Where-Object { $_.ConnectionState -eq "Connected" } | Select-Object -First 1
-        $hostName = $targetHost.Name
-
-        if (-not $targetHost) {
-            Write-Warning " -> No hay hosts conectados."
-            # [REPORTE]
+        # 1. SELECCIONAR OBJETIVO (DATASTORE)
+        $targetDatastore = Get-Datastore -Server $serverContext | Where-Object { $_.State -eq "Available" -and $_.Accessible } | Select-Object -First 1
+        
+        if (-not $targetDatastore) {
+            Write-Warning " -> No hay datastores accesibles."
             $this.alarmCheckReport += [PSCustomObject]@{
-                vCenter = $serverContext.Name; Host = "N/A"; "Path Alarma" = "N/A"; "Alarma Fuente" = $sourceAlarmName; Resultado = "No hay hosts conectados"
+                vCenter = $vcenterName; Host = "N/A"; "Path Alarma" = "N/A"; "Alarma Fuente" = $sourceAlarmName; Result = "No hay datastores accesibles"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
             }
             return
         }
-        # 2. OBTNER LA ALARMA FUENTE
+        $targetName = $targetDatastore.Name 
+
+        # 2. OBTENER ALARMA FUENTE
         $sourceAlarm = Get-AlarmDefinition -Name $sourceAlarmName -Server $serverContext -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $sourceAlarm) {
-            Write-Warning " -> No se encontró alarma '$sourceAlarmName'."
-            # [REPORTE]
-            $this.alarmCheckReport += [PSCustomObject]@{
-                vCenter = $serverContext.Name; Host = $targetHost.Name; "Path Alarma" = "N/A"; "Alarma Fuente" = $sourceAlarmName; Resultado = "No se encontró la alarma fuente"
-            }
+            $this.alarmCheckReport += [PSCustomObject]@{ vCenter = $vcenterName; Host = $targetName; "Path Alarma" = "N/A"; "Alarma Fuente" = $sourceAlarmName; Result = "No se encontró la alarma fuente"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
             return
         }
-        # 3. EXTRAER RUTA DEL SCRIPT (Tu lógica original)
+
+        # 3. EXTRAER SCRIPT
         try {
             $info = $sourceAlarm.ExtensionData.Info
             if ($info.Action -and $info.Action.Action) {
                 foreach ($triggerAction in $info.Action.Action) {
-                    $actualAction = $triggerAction.Action
-                    if ($actualAction -is [VMware.Vim.RunScriptAction]) {
-                        $scriptPath = $actualAction.Script
-                        break
+                    if ($triggerAction.Action -is [VMware.Vim.RunScriptAction]) {
+                        $scriptPath = $triggerAction.Action.Script; break 
                     }
                 }
             }
         } catch {}
-        # Validación
+
         if ([string]::IsNullOrEmpty($scriptPath)) {
-            Write-Warning " -> La alarma fuente existe pero no tiene script configurado."
-            # [REPORTE]
-            $this.alarmCheckReport += [PSCustomObject]@{
-                vCenter = $serverContext.Name; Host = $targetHost.Name; "Path Alarma" = "N/A"; "Alarma Fuente" = $sourceAlarmName; Resultado = "La alarma fuente no tiene script configurado"
-            }
+            $this.alarmCheckReport += [PSCustomObject]@{ vCenter = $vcenterName; Host = $targetName; "Path Alarma" = "N/A"; "Alarma Fuente" = $sourceAlarmName; Result = "La alarma fuente no tiene script configurado"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
             return
         }
-        # Debug Visual
-        Write-Host " -> Script encontrado: '$scriptPath'" -ForegroundColor Cyan
 
-        # 4. CREAR Y DISPARAR ALARMA DE PRUEBA
+        # 4. PREPARAR MÉTRICA (disk.used.latest)
+        $metricId = $null
+        try {
+            $perfMgr = Get-View (Get-View ServiceInstance -Server $serverContext).Content.PerfManager -Server $serverContext
+            $counterInfo = $perfMgr.PerfCounter | Where-Object { $_.GroupInfo.Key -eq "disk" -and $_.NameInfo.Key -eq "used" -and $_.RollupType -eq "latest" } | Select-Object -First 1
+            if ($counterInfo) { $metricId = [int]$counterInfo.Key } else { throw "Metric missing" }
+        }
+        catch {
+            $this.alarmCheckReport += [PSCustomObject]@{ vCenter = $vcenterName; Host = $targetName; "Path Alarma" = $scriptPath; "Alarma Fuente" = $sourceAlarmName; Result = "ERROR API Métrica"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
+            return
+        }
+
+        # 5. CREAR Y DISPARAR ALARMA
         try {
             # A. Limpieza preventiva
-            $existing = Get-AlarmDefinition -Name $alarmName -Entity $targetHost -Server $serverContext -ErrorAction SilentlyContinue
+            $existing = Get-AlarmDefinition -Name $alarmName -Entity $targetDatastore -Server $serverContext -ErrorAction SilentlyContinue
             if ($existing) { Remove-AlarmDefinition $existing -Server $serverContext -Confirm:$false }
 
-            # B. Crear Definición (API NATIVA)
+            # B. Definición Base
             $spec = New-Object VMware.Vim.AlarmSpec
             $spec.Name = $alarmName
             $spec.Description = "DevOps Smoke Test"
-            $spec.Enabled = $true
-            $spec.Setting = New-Object VMware.Vim.AlarmSetting
-            $spec.Setting.ToleranceRange = 0
-            $spec.Setting.ReportingFrequency = 0
+            $spec.Enabled = $true 
+            
+            # C. Expresión: Metric Alarm envuelta en OR
+            $expression = New-Object VMware.Vim.MetricAlarmExpression
+            $expression.Operator = "isAbove"
+            $expression.Type = "Datastore"
+            $expression.Yellow = 10 # 10 KB (Siempre se cumple)
+            $expression.Red = 20    # 20 KB (Siempre se cumple)
+            
+            $expression.Metric = New-Object VMware.Vim.PerfMetricId
+            $expression.Metric.CounterId = $metricId
+            $expression.Metric.Instance = ""
+            
+            $spec.Expression = New-Object VMware.Vim.OrAlarmExpression
+            $spec.Expression.Expression += $expression
 
-            # C. Disparador
-            $expression = New-Object VMware.Vim.StateAlarmExpression
-            $expression.Operator = "isEqual"
-            $expression.StatePath = "runtime.connectionState"
-            $expression.Type = "HostSystem"
-            $expression.Red = "connected"
-            $orExpr = New-Object VMware.Vim.OrAlarmExpression
-            $orExpr.Expression += $expression
-            $spec.Expression = $orExpr
-
-            # D. Acción
+            # D. Acción (Estructura Compleja LucD)
+            $actionGroup = New-Object VMware.Vim.GroupAlarmAction
+            $actionTrigger = New-Object VMware.Vim.AlarmTriggeringAction
+            
             $scriptAction = New-Object VMware.Vim.RunScriptAction
             $scriptAction.Script = $scriptPath
-            $t1 = New-Object VMware.Vim.AlarmTriggeringActionTransitionSpec
-            $t1.StartState = "green"; $t1.FinalState = "red"; $t1.Repeats = $false
-           
-            $triggerAction = New-Object VMware.Vim.AlarmTriggeringAction
-            $triggerAction.Action = $scriptAction
-            $triggerAction.TransitionSpecs = @($t1)
+            $actionTrigger.Action = $scriptAction
+            
+            $actionTrigger.Green2yellow = $true
+            $actionTrigger.Yellow2red = $true
+            
+            $trans1 = New-Object VMware.Vim.AlarmTriggeringActionTransitionSpec
+            $trans1.StartState = [VMware.Vim.ManagedEntityStatus]::green
+            $trans1.FinalState = [VMware.Vim.ManagedEntityStatus]::yellow
+            $trans1.Repeats = $false
+            $actionTrigger.TransitionSpecs += $trans1
+            
+            $trans2 = New-Object VMware.Vim.AlarmTriggeringActionTransitionSpec
+            $trans2.StartState = [VMware.Vim.ManagedEntityStatus]::yellow
+            $trans2.FinalState = [VMware.Vim.ManagedEntityStatus]::red
+            $trans2.Repeats = $false
+            $actionTrigger.TransitionSpecs += $trans2
 
-            $spec.Action = New-Object VMware.Vim.GroupAlarmAction
-            $spec.Action.Action = @($triggerAction)
+            $actionGroup.Action += $actionTrigger
+            $spec.Action = $actionGroup
 
-            # E. Crear en vCenter
-            Write-Host "`t   -> Activando en $($targetHost.Name)..." -NoNewline
-           
+            # Setting
+            $spec.Setting = New-Object VMware.Vim.AlarmSetting
+            $spec.Setting.ReportingFrequency = 0
+            $spec.Setting.ToleranceRange = 0
+            $spec.ActionFrequency = 0
+
+            # E. Crear
             $alarmManager = Get-View AlarmManager -Server $serverContext
-            $moref = $alarmManager.CreateAlarm($targetHost.ExtensionData.MoRef, $spec)
-           
-            Write-Host " DISPARADA." -ForegroundColor Green
+            $moref = $alarmManager.CreateAlarm($targetDatastore.ExtensionData.MoRef, $spec)
+            
+            # F. Esperar y Validar
+            Start-Sleep -Seconds 15
+            
+            $events = Get-VIEvent -Entity $targetDatastore -MaxSamples 50 -Server $serverContext | Where-Object { $_.FullFormattedMessage -like "*$alarmName*" }
+            
+            if ($events | Where-Object { $_ -is [VMware.Vim.AlarmScriptCompleteEvent] }) {
+                $reportResult = "SUCCESS"
+            } elseif ($events | Where-Object { $_ -is [VMware.Vim.AlarmScriptFailedEvent] }) {
+                $reportResult = "FAILED: Script execution error"
+            } else {
+                # Fallback Visual
+                $dsView = Get-View $targetDatastore.Id -Property TriggeredAlarmState -Server $serverContext
+                $triggeredState = $dsView.TriggeredAlarmState | Where-Object { $_.Alarm.Value -eq $moref.Value }
+                if ($triggeredState -and $triggeredState.OverallStatus -eq "red") {
+                    $reportResult = "SUCCESS (Falso positivo ejecutado)"
+                } else {
+                    $reportResult = "WARNING: Alarm created but trigger failed"
+                }
+            }
 
-            # F. Esperar y Borrar
-            Start-Sleep -Seconds 5
+            # G. Limpieza
             $created = Get-View $moref -Server $serverContext
             $created.RemoveAlarm()
-            Write-Host "`t   -> Alarma eliminada." -ForegroundColor Green
-            $reportResult = "SUCCESS"
-
         }
-
         catch {
             Write-Warning "`nError en prueba de alarma: $($_.Exception.Message)"
             $reportResult = "ERROR: $($_.Exception.Message)"
-
-            # Limpieza de emergencia
-            $al = Get-AlarmDefinition -Name $alarmName -Entity $targetHost -Server $serverContext -ErrorAction SilentlyContinue
+            $al = Get-AlarmDefinition -Name $alarmName -Entity $targetDatastore -Server $serverContext -ErrorAction SilentlyContinue
             if ($al) { Remove-AlarmDefinition $al -Server $serverContext -Confirm:$false }
         }
 
-        # [REPORTE FINAL - ÉXITO O ERROR DE API]
+        # [REPORTE FINAL]
         $this.alarmCheckReport += [PSCustomObject]@{
             vCenter         = $vcenterName
-            Host            = $hostName
-            "Alarm Path"   = $scriptPath
-            "Alarm Source" = $sourceAlarmName
-            Result       = $reportResult
+            Host            = $targetName
+            "Alarm Name"   = $sourceAlarmName
+            "Script Path" = $scriptPath
+            Result          = $reportResult
             Timestamp       = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        }
+        
+        $this.auditAlarmConfiguration($serverContext, $vcenterName)
+        Write-Host " -> OK." -ForegroundColor Green
+    }
+
+    # ---------------------------------------------------------
+    # FUNCIÓN AUXILIAR: AUDITORÍA DE LISTA DE ALARMAS
+    # ---------------------------------------------------------
+    auditAlarmConfiguration($serverContext, $vcenterName) {
+        
+        # 1. Detectar si hay vSAN habilitado en algún cluster
+        $isVsanEnabled = $false
+        try {
+            $clusters = Get-Cluster -Server $serverContext -ErrorAction SilentlyContinue
+            foreach ($c in $clusters) {
+                if ($c.VsanEnabled) { $isVsanEnabled = $true; break }
+            }
+        } catch {}
+
+        # 2. Definir las listas de alarmas
+        $standardAlarms = @(
+            "Host battery status", "Host connection failure", "Host hardware fan status", 
+            "Host hardware power status", "Host hardware system board status", "Host hardware temperature status", 
+            "Host hardware voltage", "Network connectivity lost", "Network uplink redundancy degraded", 
+            "Network uplink redundancy lost", "Unmanaged workload detected on SIOC-enabled datastore", 
+            "Cannot connect to storage", "Certificate Status", "ESXi Host Certificate Status", 
+            "Insufficient vSphere HA failover resources", "vSphere HA failover in progress"
+        )
+
+        $vsanAlarms = @(
+            "Errors occurred on the disk(s) of a vSAN host", "vSAN capacity utilization alarm 'What if the most consumed host fails'",
+            "vSAN capacity utilization alarm 'Storage space'", "vSAN cluster alarm 'vSAN daemon liveness'",
+            "vSAN network alarm 'Hosts with connectivity issues'", "vSAN network alarm 'Network latency check'",
+            "vSAN network alarm 'vSAN cluster partition'", "vSAN online health alarm 'vSAN critical alert regarding a potential data inconsistency'",
+            "vSAN physical disk alarm 'Component limit'", "vSAN physical disk alarm 'Congestion'",
+            "vSAN physical disk alarm 'Operation'", "vSAN physical disk alarm 'Disk capacity'",
+            "vSAN stretched cluster alarm 'Witness host not found'", "vSAN stretched cluster alarm for 'Site latency' health",
+            "vSAN performance service alarm 'Verbose mode'", "vSAN performance service alarm 'Network diagnostic mode'"
+        )
+
+        # 3. Combinar listas según corresponda
+        $alarmsToCheck = $standardAlarms
+        if ($isVsanEnabled) {
+            $alarmsToCheck += $vsanAlarms
+        }
+
+        # 4. Iterar y Verificar
+        foreach ($alarmName in $alarmsToCheck) {
+            $status = "Not Found"
+            $path = "N/A"
+            
+            # Buscamos la definición exacta
+            $def = Get-AlarmDefinition -Name $alarmName -Server $serverContext -ErrorAction SilentlyContinue | Select-Object -First 1
+            
+            if ($def) {
+                $status = "No Script Configured"
+                
+                # Inspeccionamos las acciones
+                try {
+                    $info = $def.ExtensionData.Info
+                    if ($info.Action -and $info.Action.Action) {
+                        foreach ($triggerAction in $info.Action.Action) {
+                            if ($triggerAction.Action -is [VMware.Vim.RunScriptAction]) {
+                                $script = $triggerAction.Action.Script
+                                if (-not [string]::IsNullOrWhiteSpace($script)) {
+                                    $path = $script
+                                    $status = "OK"
+                                } else {
+                                    $status = "Script Action Empty"
+                                }
+                                break 
+                            }
+                        }
+                    }
+                } catch {
+                    $status = "Error reading actions"
+                }
+            }
+
+            # Guardamos en el MISMO reporte
+            $this.alarmCheckReport += [PSCustomObject]@{
+                vCenter      = $vcenterName
+                Host         = "-" # No aplica a host específico
+                "Alarm Name" = $alarmName
+                "Script Path"= $path
+                Result       = $status
+                Timestamp    = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            }
         }
     }
     
@@ -750,7 +950,6 @@ class Proactiva {
             "Root User"       = $rootUser
             "Expiration Date" = $expirationDate
             "Days Remaining"  = $daysRemaining
-            "Data Status"     = $rootStatus
         }
         
         Write-Host " -> OK." -ForegroundColor Green
@@ -979,32 +1178,47 @@ class Proactiva {
     }
 
     processBackupActivity() {
-        Write-Host "`tProcessing Backup Activity (Smart Fallback)..." -NoNewline
+        Write-Host "`tProcessing Backup Activity (Smart Fallback + Context)..." -NoNewline
         
-        $cisFQDN = $this.currentVCenter.Name
-        if (-not $cisFQDN) { $cisFQDN = $this.currentVCenter }
+        # 1. Obtener nombre limpio del vCenter para el reporte
+        $rawVCenter = $this.currentVCenter
+        $cisFQDN = if ($rawVCenter.Name) { $rawVCenter.Name } else { $rawVCenter }
         
         Import-Module VMware.VimAutomation.Cis.Core -ErrorAction SilentlyContinue
+
+        # 2. Obtener la conexión CIS específica para este vCenter
+        $cisConnection = $global:cisConnections[$cisFQDN]
+
+        # Fallback: Si no está en el llavero, buscar en las conexiones globales por nombre
+        if (-not $cisConnection) {
+            $cisConnection = $global:DefaultCisServers | Where-Object { $_.Name -eq $cisFQDN } | Select-Object -First 1
+        }
+
+        if (-not $cisConnection) {
+            Write-Warning " -> No hay conexión CIS activa para $cisFQDN. (Error de permisos/conexión previa)"
+            $this.backupActivityReport += [PSCustomObject]@{
+                vCenter = $cisFQDN; Type = "-"; Status = "Error de Conexión CIS"; "Data Transfer" = "-"; Location = "-"; StartTime = "-"; EndTime = "-"; Duration = "-"
+            }
+            return
+        }
 
         try {
             $allJobs = @()
             $usandoDetalles = $false
 
-            # --- INTENTO 1: Usar el servicio de DETALLES (Rico en datos) ---
+            # --- INTENTO 1: Servicio de DETALLES (Rico en datos) ---
             try {
                 $detailServiceName = "com.vmware.appliance.recovery.backup.job.details"
-                $detailsService = Get-CisService -Name $detailServiceName | Select-Object -First 1
+                # [CORRECCIÓN] Usamos -Server (no -CisServer)
+                $detailsService = Get-CisService -Name $detailServiceName -Server $cisConnection -ErrorAction SilentlyContinue | Select-Object -First 1
 
                 if ($detailsService) {
                     $jobsMap = $detailsService.list($null)
                     
                     if ($jobsMap) {
-                        # [CORRECCIÓN] Recorremos el diccionario para preservar el ID
                         foreach ($entry in $jobsMap.GetEnumerator()) {
                             $jobObj = $entry.Value
                             $jobIdKey = $entry.Key
-                            
-                            # Inyectamos el ID en el objeto si no lo tiene
                             if ($null -eq $jobObj.id) {
                                 $jobObj | Add-Member -MemberType NoteProperty -Name "id" -Value $jobIdKey -Force
                             }
@@ -1013,33 +1227,24 @@ class Proactiva {
                         $usandoDetalles = $true
                     }
                 }
-            } catch {
-                # Si falla el servicio de detalles, seguimos silenciosamente al intento 2
-            }
+            } catch { }
 
-            # --- INTENTO 2 (Fallback): Usar el servicio SIMPLE (Solo estado y fechas) ---
-            # Solo entramos aquí si el intento 1 no trajo nada
+            # --- INTENTO 2: Servicio SIMPLE (Solo estado y fechas) ---
             if ($allJobs.Count -eq 0) {
-                $simpleServiceName = "com.vmware.appliance.recovery.backup.job" | Select-Object -First 1
-                $simpleService = Get-CisService -Name $simpleServiceName -ErrorAction Stop
+                $simpleServiceName = "com.vmware.appliance.recovery.backup.job"
+                # [CORRECCIÓN] Usamos -Server
+                $simpleService = Get-CisService -Name $simpleServiceName -Server $cisConnection -ErrorAction SilentlyContinue | Select-Object -First 1
                 
                 if ($simpleService) {
-                    # 1. Obtenemos solo la lista de IDs
-                    $jobIds = $simpleService.list()
+                    # Obtenemos la lista y aseguramos que sea un array de strings limpio
+                    $rawList = $simpleService.list()
+                    # A veces viene como objeto con propiedad Value, a veces directo. Esto lo normaliza:
+                    if ($rawList.Value) { $jobIds = $rawList.Value } else { $jobIds = $rawList }
                     
-                    # 2. Ordenamos los IDs (que tienen fecha) para procesar solo los últimos 7
-                    # Esto optimiza la velocidad evitando hacer .get() de 300 trabajos viejos
-                    $latestIds = $jobIds | Sort-Object -Descending | Select-Object -First 7
-
-                    foreach ($jid in $latestIds) {
+                    foreach ($jid in $jobIds) {
                          try { 
-                             # Obtenemos el objeto de estado básico
                              $j = $simpleService.get($jid)
-                             
-                             # Aseguramos que tenga el ID pegado
-                             if (!$j.id) { 
-                                 $j | Add-Member -MemberType NoteProperty -Name "id" -Value $jid -Force 
-                             }
+                             if (!$j.id) { $j | Add-Member -Name "id" -Value $jid -Force }
                              $allJobs += $j
                          } catch {}
                     }
@@ -1048,33 +1253,36 @@ class Proactiva {
 
             # --- Generación del Reporte ---
             if ($allJobs.Count -eq 0) {
+                 # Caso VACÍO: Marcamos como "No Configurado"
                  $this.backupActivityReport += [PSCustomObject]@{
-                    vCenter = $cisFQDN; Status = "No Backups Found"; Details = "No se pudo recuperar información."
+                    vCenter          = $cisFQDN
+                    Type             = "-"
+                    Status           = "No Configurado"
+                    "Data Transfer"  = "-"
+                    Location         = "-"
+                    StartTime        = "-"
+                    EndTime          = "-"
+                    Duration         = "-"
                  }
-                 Write-Host " -> Sin datos." -ForegroundColor Yellow
+                 Write-Host " -> Sin historial (Marcado como No Configurado)." -ForegroundColor Yellow
                  return
             }
             
-            # Ordenamos y seleccionamos los últimos 7 (Por si vienen del Intento 1 desordenados)
+            # Procesamiento Normal
             $backupHistory = $allJobs | Sort-Object start_time -Descending | Select-Object -First 7
             
             foreach ($job in $backupHistory) {
-                # Campos Comunes
                 $status = if ($job.state) { $job.state } else { $job.status }
                 $startTime = Get-Date $job.start_time -Format "yyyy-MM-dd HH:mm:ss"
                 $endTime = Get-Date $job.end_time -Format "yyyy-MM-dd HH:mm:ss"
                 
-                # Duración
                 $duration = "N/A"
                 if ($job.end_time -and $job.start_time) {
                     $ts = New-TimeSpan -Start $job.start_time -End $job.end_time
                     $duration = "{0:hh\:mm\:ss}" -f $ts
                 }
 
-                # Campos Exclusivos de Details (Si falló Intento 1, serán N/A)
-                $location = "N/A"
-                $sizeGB = "N/A"
-                $type = "N/A"
+                $location = "N/A"; $sizeGB = "N/A"; $type = "N/A"
 
                 if ($usandoDetalles) {
                     if ($job.location) { $location = $job.location }
@@ -1084,12 +1292,8 @@ class Proactiva {
                     }
                 }
 
-                # El ID ya está garantizado por la lógica de arriba
-                $finalJobId = if ($job.id) { $job.id } else { "UnknownID" }
-
                 $this.backupActivityReport += [PSCustomObject]@{
                     vCenter          = $cisFQDN
-                    #JobId            = $finalJobId
                     Type             = $type
                     Status           = $status
                     "Data Transfer"  = $sizeGB
@@ -1104,8 +1308,9 @@ class Proactiva {
         }
         catch {
             Write-Warning "`nError en Backup Activity: $($_.Exception.Message)"
-            # Agregamos línea de error al excel para que no quede vacío
-            $this.backupActivityReport += [PSCustomObject]@{ vCenter = $cisFQDN; Status = "ERROR"; Details = $_.Exception.Message }
+            $this.backupActivityReport += [PSCustomObject]@{
+                vCenter = $cisFQDN; Type = "-"; Status = "Error API: $($_.Exception.Message)"; "Data Transfer" = "-"; Location = "-"; StartTime = "-"; EndTime = "-"; Duration = "-"
+            }
         }
     }
 
