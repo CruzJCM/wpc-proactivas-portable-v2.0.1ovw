@@ -206,25 +206,7 @@ function Connect-Endpoints($modules) {
     return $result
 }
 
-function Connect-VeeamEndpoints {
-    # 1. Verificar si el usuario eligió Veeam
-    $veeamEndpoint = $Global:connections | Where-Object { $_.component -eq "veeam" }
-    if (-not $veeamEndpoint) { return $true }
-
-    # 2. Mensaje de interfaz
-    Write-Host "`n--- Configuración de Conexión a Veeam Backup & Replication ---" -ForegroundColor Yellow
-    Write-Host "Modo Puente: La conexión se realizará en la siguiente ventana." -ForegroundColor Gray
-    
-    # 3. [CLAVE] Falsificar la conexión para que DatosVeeam se ejecute
-    # Si no llenamos la propiedad .conn, el framework piensa que falló y no ejecuta el plugin.
-    $veeamEndpoint.conn = @("BridgeMode") 
-    $veeamEndpoint.host = "LocalConsole"
-    
-    # 4. Retornar éxito siempre
-    return $true
-}
-
-#function Connect-Endpoint($component){
+#unction Connect-Endpoint($component){
 	# if($component -eq "vcenter"){
 	# 	"Debe conectarse a un vCenter. Ingrese los parametros para conectarse"
 	# 	$server = Read-Host "Host"

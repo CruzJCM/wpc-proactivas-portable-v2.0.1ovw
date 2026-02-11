@@ -1311,7 +1311,7 @@ function Licencia {
         $expiraRaw = $licencia.ExpirationDate
         $esProblematicaInicial = $false
 
-        if ([int]$licencia.Used -gt [int]$licencia.Total) {
+        if ($licencia.Used -gt $licencia.Total) {
             $encontroExcedida = $true
             $esProblematicaInicial = $true
         }
@@ -1925,102 +1925,131 @@ function performanceHealthCheck {
 
 function alarmCheck {
     # 1. Importar datos
+    # Usamos la misma lógica que en performanceHealthCheck que confirmaste que funciona
     $todosLosDatos = Get-ChildItem -Path $excelMasReciente -Filter *.xlsx | ForEach-Object {
-        Import-Excel -Path $_.FullName -WorksheetName "Falso Positivo"
+        try { 
+            Import-Excel -Path $_.FullName -WorksheetName "Falso Positivo" -ErrorAction Stop 
+        } catch { 
+            # Si la hoja no existe en un excel viejo, lo ignoramos
+        }
     } | Where-Object { -not [string]::IsNullOrEmpty($_.vCenter) }
 
-    # --- CONDICIÓN GLOBAL: SIN ACCESO ---
+    # --- CONDICIÓN GLOBAL: SIN ACCESO (Si no se trajo nada de ningún lado) ---
     if (-not $todosLosDatos -or $todosLosDatos.Count -eq 0) {
         return [PSCustomObject]@{
-            ID        = "VSP-MON-02" 
+            ID        = "VSP-ME-13" 
             Resultado = "Sin acceso"
-            Detalle   = "No se encontraron registros de la prueba de alarmas (hoja vacía)."
+            Detalle   = "No se encontraron registros de la prueba de alarmas (hoja vacía o no encontrada)."
         }
     }
 
     $informeFinal = @()
     $countExitos = 0
     $countFallas = 0
-    
-    # Lista para acumular las causas raíces de los fallos (sin repetir)
-    $diagnosticos = @()
+    $causas = @()
+    $tokensEncontrados = @()
 
     # 2. Procesar cada fila
     foreach ($fila in $todosLosDatos) {
-        $resultadoPrueba = $fila.Result
-        $esHallazgo = $false
-        $diagnosticoFila = ""
+        # Limpieza y Normalización
+        $resultado = if ($fila.Result) { $fila.Result.ToString().Trim() } else { "" }
+        
+        $nombreAlarma = if ($fila."Alarm Name") { $fila."Alarm Name" } else { $fila."Alarm Source" }
+        
+        $rutaScript = if ($fila."Script Path") { $fila."Script Path" } else { $fila."Alarm Path" }
+        if (-not $rutaScript) { $rutaScript = $fila."Path Alarma" }
 
-        if ($resultadoPrueba -eq "SUCCESS") {
+        $esHallazgo = $false
+        $diagnostico = ""
+
+        # --- VALIDACIÓN DE ÉXITO ---
+        # Aceptamos OK, SUCCESS, o mensajes compuestos que empiezan con SUCCESS
+        if ($resultado -eq "OK" -or $resultado -match "^SUCCESS") {
             $countExitos++
+
+            # Análisis de Tokens (Solo en los exitosos)
+            if (-not [string]::IsNullOrEmpty($rutaScript) -and $rutaScript -ne "N/A") {
+                $partes = $rutaScript -split "\s+"
+                if ($partes.Count -gt 1) {
+                    $token = ($partes[1..($partes.Count - 1)]) -join " "
+                    $tokensEncontrados += $token
+                }
+            }
         }
         else {
+            # CASO FALLO
             $countFallas++
             $esHallazgo = $true
             
-            # --- INTELIGENCIA DE DIAGNÓSTICO ---
-            # Analizamos el texto del error para dar una causa probable
-            switch -Wildcard ($resultadoPrueba) {
-                "*No hay hosts conectados*" {
-                    $diagnosticoFila = "Imposible ejecutar: El vCenter no tiene hosts conectados/operativos."
+            # Diagnóstico Inteligente
+            switch -Wildcard ($resultado) {
+                "*No Script Configured*" { 
+                    $diagnostico = "Configuración: Alarma sin acción de script"
+                    if ("Configuración incompleta" -notin $causas) { $causas += "Configuración incompleta" }
                 }
-                "*No se encontró*alarma fuente*" {
-                    $diagnosticoFila = "Configuración incompleta: No existe la alarma 'Host Battery Status' para copiar."
+                "*Script Action Empty*" { 
+                    $diagnostico = "Configuración: Acción de script vacía"
+                    if ("Configuración incompleta" -notin $causas) { $causas += "Configuración incompleta" }
                 }
-                "*no tiene script configurado*" {
-                    $diagnosticoFila = "Configuración incompleta: La alarma 'Host Battery Status' existe pero no tiene un script asignado."
+                "*Not Found*" { 
+                    $diagnostico = "Alarma no encontrada en vCenter"
+                    if ("Alarmas faltantes" -notin $causas) { $causas += "Alarmas faltantes" }
                 }
-                "*spec*" {
-                    $diagnosticoFila = "Error API: Fallo interno al construir el objeto de alarma (posible incompatibilidad de versión)."
+                "*No hay hosts*" { 
+                    $diagnostico = "Sin hosts conectados"
+                    if ("Entorno no disponible" -notin $causas) { $causas += "Entorno no disponible" }
                 }
-                "*Permission*" {
-                    $diagnosticoFila = "Permisos: La cuenta de servicio no tiene privilegios para crear/borrar alarmas."
+                "*Failed*" { 
+                    $diagnostico = "Fallo funcional (Smoke Test)"
+                    if ("Fallo funcional" -notin $causas) { $causas += "Fallo funcional" }
                 }
-                Default {
-                    # Si es otro error técnico, lo mostramos tal cual pero resumido
-                    $diagnosticoFila = "Error Técnico: $resultadoPrueba"
+                Default { 
+                    $diagnostico = "Error: $resultado"
+                    if ("Errores varios" -notin $causas) { $causas += "Errores varios" }
                 }
             }
 
-            # Agregamos el diagnóstico a la lista global de causas (para el checklist)
-            if ($diagnosticos -notcontains $diagnosticoFila) {
-                $diagnosticos += $diagnosticoFila
-            }
-        }
-
-        # 3. Guardar hallazgo en Anexo Técnico
-        if ($esHallazgo) {
+            # Guardar en Anexo
             $informeFinal += [PSCustomObject]@{
                 "vCenter"       = $fila.vCenter
                 "Host"          = $fila.Host
-                "Path Alarma"   = $fila."Alarm Path"
-                "Alarma Fuente" = $fila."Alarm Source"
-                "Resultado"     = $resultadoPrueba
+                "Alarma"        = $nombreAlarma
+                "Script Path"   = $rutaScript
+                "Resultado"     = $resultado
+                "Diagnóstico"   = $diagnostico
                 "Timestamp"     = $fila.Timestamp
             }
         }
     }
 
-    # 4. Definir el Resultado Final del Checklist
+    # 3. Definir Resultado del Checklist
     $resultadoChecklist = "Resultado Esperado"
-    $detalleChecklist = "VERIFICAR EN JIRA. La prueba de falso positivo se ejecutó correctamente en todos los vCenters ($countExitos pruebas exitosas)."
+    $detalleChecklist = "Se verificaron $countExitos alarmas/pruebas correctamente."
+
+    # Análisis de Consistencia de Tokens
+    $tokensUnicos = @($tokensEncontrados | Select-Object -Unique)
+    $notaInconsistencia = ""
+    
+    if ($tokensUnicos.Count -gt 1) {
+        $notaInconsistencia = " (Nota: Se detectaron $($tokensUnicos.Count) variantes de tokens/argumentos)."
+        # Si quieres agregar la nota al detalle de éxito:
+        if ($countFallas -eq 0) { $detalleChecklist += $notaInconsistencia }
+    }
 
     if ($countFallas -gt 0) {
         $resultadoChecklist = "No recomendado"
-        
-        # Construimos un mensaje inteligente uniendo los diagnósticos únicos
-        $causasTexto = $diagnosticos -join "; "
-        $detalleChecklist = "Falló la prueba en $countFallas vCenter(s). Causas detectadas: $causasTexto"
+        $resumenCausas = $causas -join ", "
+        $detalleChecklist = "Se detectaron $countFallas anomalías. Causas: $resumenCausas.$notaInconsistencia"
     }
 
-    # 5. Exportar al Anexo Técnico
+    # 4. Exportar al Anexo Técnico
     if ($informeFinal.Count -gt 0) {
         Exportar-InformeConEstilo -Datos $informeFinal `
                                   -RutaArchivo $archivoSalida `
                                   -NombreHoja "Falso Positivo"
     }
 
-    # 6. Retornar objeto para el Checklist
+    # 5. Retornar objeto
     return [PSCustomObject]@{
         ID        = "VSP-ME-13" 
         Resultado = $resultadoChecklist
@@ -2240,7 +2269,7 @@ function vdsBackupCheck {
     else {
         # Caso Éxito Total
         $resultadoChecklist = "Resultado Esperado"
-        $detalleChecklist = "Se realizaron los backups correctamente. Chequear path: $rutaBackups"
+        $detalleChecklist = "Se realizaron los backups correctamente. Recuerde subir los archivos. Chequear path: $rutaBackups"
     }
 
     # 5. Retornar objeto para el Checklist

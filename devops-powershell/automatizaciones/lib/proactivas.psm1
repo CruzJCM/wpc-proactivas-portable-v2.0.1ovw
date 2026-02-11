@@ -633,45 +633,109 @@ class Proactiva {
     
 
     processAlarmCheck($hosts, $vcenterConnection) {
-        Write-Host "`tProcessing Alarm Check (Datastore Target)..." -NoNewline
+        Write-Host "`tProcessing Alarm Check (Audit & Smoke Test)..." -NoNewline
         
         $serverContext = $this.currentVCenter
-        $vcenterName = $vcenterConnection.Name
+        # Aseguramos obtener el nombre del servidor correctamente
+        $vcenterName = if ($vcenterConnection.Name) { $vcenterConnection.Name } else { $vcenterConnection }
         
+        # --- PARTE 1: SMOKE TEST (Tu lógica original de crear/borrar alarma) ---
+        # (Mantenemos esta parte igual porque ya funcionaba bien, solo ajustamos variables)
         $uniqueId = (Get-Date).ToString("yyyyMMdd_HHmmss")
-        $alarmName = "Falso Positivo DS $uniqueId"
-        $sourceAlarmName = "Host connection failure"
+        $alarmName = "Falso Positivo $vcenterName $uniqueId"
+        $sourceAlarmName = "Host Battery Status"
         $scriptPath = $null
         $reportResult = "Pendiente"
 
-        # 1. SELECCIONAR OBJETIVO (DATASTORE)
-        $targetDatastore = Get-Datastore -Server $serverContext | Where-Object { $_.State -eq "Available" -and $_.Accessible } | Select-Object -First 1
-        
-        if (-not $targetDatastore) {
-            Write-Warning " -> No hay datastores accesibles."
-            $this.alarmCheckReport += [PSCustomObject]@{
-                vCenter = $vcenterName; Host = "N/A"; "Path Alarma" = "N/A"; "Alarma Fuente" = $sourceAlarmName; Result = "No hay datastores accesibles"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-            }
-            return
-        }
-        $targetName = $targetDatastore.Name 
+        $targetHost = $hosts | Where-Object { $_.ConnectionState -eq "Connected" } | Select-Object -First 1
+        $hostName = if ($targetHost) { $targetHost.Name } else { "N/A" }
 
-        # 2. OBTENER ALARMA FUENTE
-        $sourceAlarm = Get-AlarmDefinition -Name $sourceAlarmName -Server $serverContext -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $sourceAlarm) {
-            $this.alarmCheckReport += [PSCustomObject]@{ vCenter = $vcenterName; Host = $targetName; "Path Alarma" = "N/A"; "Alarma Fuente" = $sourceAlarmName; Result = "No se encontró la alarma fuente"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
-            return
-        }
-
-        # 3. EXTRAER SCRIPT
-        try {
-            $info = $sourceAlarm.ExtensionData.Info
-            if ($info.Action -and $info.Action.Action) {
-                foreach ($triggerAction in $info.Action.Action) {
-                    if ($triggerAction.Action -is [VMware.Vim.RunScriptAction]) {
-                        $scriptPath = $triggerAction.Action.Script; break 
+        # Si no hay hosts, no podemos hacer el smoke test, pero SÍ podemos auditar las definiciones
+        if ($targetHost) {
+            # ... (Lógica de Smoke Test existente) ...
+            # Recuperamos la alarma fuente para extraer el script
+            $sourceAlarm = Get-AlarmDefinition -Name $sourceAlarmName -Server $serverContext -ErrorAction SilentlyContinue | Select-Object -First 1
+            
+            if ($sourceAlarm) {
+                # Intentamos extraer el script
+                try {
+                    $info = $sourceAlarm.ExtensionData.Info
+                    if ($info.Action -and $info.Action.Action) {
+                        foreach ($triggerAction in $info.Action.Action) {
+                            if ($triggerAction.Action -is [VMware.Vim.RunScriptAction]) {
+                                $scriptPath = $triggerAction.Action.Script; break
+                            }
+                        }
                     }
+                } catch {}
+
+                if (-not [string]::IsNullOrEmpty($scriptPath)) {
+                    # Ejecutamos el Smoke Test (Crear/Borrar)
+                    try {
+                        # Limpieza preventiva
+                        $existing = Get-AlarmDefinition -Name $alarmName -Entity $targetHost -Server $serverContext -ErrorAction SilentlyContinue
+                        if ($existing) { Remove-AlarmDefinition $existing -Server $serverContext -Confirm:$false }
+
+                        # Crear Definición
+                        $spec = New-Object VMware.Vim.AlarmSpec; $spec.Name = $alarmName; $spec.Description = "DevOps Smoke Test"; $spec.Enabled = $true 
+                        $spec.Setting = New-Object VMware.Vim.AlarmSetting; $spec.Setting.ToleranceRange = 0; $spec.Setting.ReportingFrequency = 0
+                        $expression = New-Object VMware.Vim.StateAlarmExpression; $expression.Operator = "isEqual"; $expression.StatePath = "runtime.connectionState"; $expression.Type = "HostSystem"; $expression.Red = "connected"
+                        $orExpr = New-Object VMware.Vim.OrAlarmExpression; $orExpr.Expression += $expression; $spec.Expression = $orExpr
+
+                        # Acción
+                        $scriptAction = New-Object VMware.Vim.RunScriptAction; $scriptAction.Script = $scriptPath
+                        $t1 = New-Object VMware.Vim.AlarmTriggeringActionTransitionSpec; $t1.StartState = "green"; $t1.FinalState = "red"; $t1.Repeats = $false
+                        $triggerAction = New-Object VMware.Vim.AlarmTriggeringAction; $triggerAction.Action = $scriptAction; $triggerAction.TransitionSpecs = @($t1)
+                        $spec.Action = New-Object VMware.Vim.GroupAlarmAction; $spec.Action.Action = @($triggerAction)
+
+                        # Crear
+                        $alarmManager = Get-View AlarmManager -Server $serverContext
+                        $moref = $alarmManager.CreateAlarm($targetHost.ExtensionData.MoRef, $spec)
+                        
+                        # Esperar y Borrar
+                        Start-Sleep -Seconds 2
+                        $created = Get-View $moref -Server $serverContext; $created.RemoveAlarm()
+                        
+                        $reportResult = "SUCCESS - Smoke Test OK"
+                    }
+                    catch {
+                        $reportResult = "ERROR: Smoke Test Failed ($($_.Exception.Message))"
+                        # Limpieza emergencia
+                        $al = Get-AlarmDefinition -Name $alarmName -Entity $targetHost -Server $serverContext -ErrorAction SilentlyContinue
+                        if ($al) { Remove-AlarmDefinition $al -Server $serverContext -Confirm:$false }
+                    }
+                } else {
+                    $reportResult = "SKIPPED: Source alarm has no script"
                 }
+            } else {
+                $reportResult = "SKIPPED: Source alarm not found"
+            }
+        } else {
+            $reportResult = "SKIPPED: No hosts connected"
+        }
+
+        # Guardamos el resultado del Smoke Test (Fila 1 del reporte)
+        $this.alarmCheckReport += [PSCustomObject]@{
+            vCenter = $vcenterName; Host = $hostName; "Alarm Name" = "SMOKE TEST ($alarmName)"; "Script Path" = $scriptPath; Result = $reportResult; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        }
+
+        # --- PARTE 2: AUDITORÍA DE CONFIGURACIÓN (Lista Completa) ---
+        $this.auditAlarmConfiguration($serverContext, $vcenterName)
+        
+        Write-Host " -> OK." -ForegroundColor Green
+    }
+
+    # ---------------------------------------------------------
+    # FUNCIÓN AUXILIAR: AUDITORÍA DE LISTA DE ALARMAS
+    # ---------------------------------------------------------
+    auditAlarmConfiguration($serverContext, $vcenterName) {
+        
+        # 1. Detectar si hay vSAN habilitado en algún cluster
+        $isVsanEnabled = $false
+        try {
+            $clusters = Get-Cluster -Server $serverContext -ErrorAction SilentlyContinue
+            foreach ($c in $clusters) {
+                if ($c.VsanEnabled) { $isVsanEnabled = $true; break }
             }
         } catch {}
 
