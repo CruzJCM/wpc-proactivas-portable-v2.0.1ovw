@@ -1,11 +1,10 @@
 #Author: Santiago Alvarez
 #Githb: SanntAlv
 
-$baseDir = $PSScriptRoot #portable
+$baseDir = $PSScriath "resultado.txt"
 $directorioReportesJson = Join-Path -Path $baseDir -ChildPath "devops-powershell\reportes" 
 $directorioExcelFinal   = Join-Path -Path $baseDir -ChildPath "devops-powershell\reportes\proactiva-excel"
-$rutaArchivoResultado = Join-Path -Path $baseDir -ChildPath "resultado.txt"
-
+$rutaArchivoResultado = Join-Path -Path $baseDir -ChildP
 try {
     Import-Module ImportExcel -ErrorAction Stop
 }

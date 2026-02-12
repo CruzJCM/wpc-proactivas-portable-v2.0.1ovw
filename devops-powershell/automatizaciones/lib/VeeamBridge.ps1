@@ -672,7 +672,6 @@ try {
 
     # 3. Ejecutar Metodos de Recoleccion (Cada uno llena su lista)
     Write-Host "`n[3/4] Ejecutando tareas de recoleccion..." -ForegroundColor Cyan
-    $proactiva.GetVeeamJobs()
     $proactiva.GetVeeamRepositories()
     $proactiva.GetVeeamProxies()
     $proactiva.GetVeeamConfigBackup()
