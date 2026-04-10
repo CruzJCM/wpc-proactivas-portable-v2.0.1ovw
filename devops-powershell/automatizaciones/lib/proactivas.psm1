@@ -633,14 +633,14 @@ class Proactiva {
     
 
     processAlarmCheck($hosts, $vcenterConnection) {
-        Write-Host "`tProcessing Alarm Check (Datastore Target)..." -NoNewline
+        Write-Host "`tProcessing Alarm Check (Datastore Target & Dynamic Script)..." -NoNewline
         
         $serverContext = $this.currentVCenter
         $vcenterName = $vcenterConnection.Name
         
         $uniqueId = (Get-Date).ToString("yyyyMMdd_HHmmss")
         $alarmName = "Falso Positivo DS $uniqueId"
-        $sourceAlarmName = "Host connection failure"
+        $sourceAlarmName = "N/A"
         $scriptPath = $null
         $reportResult = "Pendiente"
 
@@ -650,37 +650,45 @@ class Proactiva {
         if (-not $targetDatastore) {
             Write-Warning " -> No hay datastores accesibles."
             $this.alarmCheckReport += [PSCustomObject]@{
-                vCenter = $vcenterName; Host = "N/A"; "Path Alarma" = "N/A"; "Alarma Fuente" = $sourceAlarmName; Result = "No hay datastores accesibles"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                vCenter = $vcenterName; Host = "N/A"; "Alarm Name" = "N/A"; "Script Path" = "N/A"; Result = "No hay datastores accesibles"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
             }
             return
         }
         $targetName = $targetDatastore.Name 
 
-        # 2. OBTENER ALARMA FUENTE
-        $sourceAlarm = Get-AlarmDefinition -Name $sourceAlarmName -Server $serverContext -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $sourceAlarm) {
-            $this.alarmCheckReport += [PSCustomObject]@{ vCenter = $vcenterName; Host = $targetName; "Path Alarma" = "N/A"; "Alarma Fuente" = $sourceAlarmName; Result = "No se encontró la alarma fuente"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
-            return
-        }
-
-        # 3. EXTRAER SCRIPT
-        try {
-            $info = $sourceAlarm.ExtensionData.Info
-            if ($info.Action -and $info.Action.Action) {
-                foreach ($triggerAction in $info.Action.Action) {
-                    if ($triggerAction.Action -is [VMware.Vim.RunScriptAction]) {
-                        $scriptPath = $triggerAction.Action.Script; break 
+        # 2. BUSCAR ALARMA FUENTE (Dinámicamente)
+        # Obtenemos todas las alarmas y buscamos la primera que tenga un script configurado
+        $allAlarms = Get-AlarmDefinition -Server $serverContext -ErrorAction SilentlyContinue
+        
+        foreach ($def in $allAlarms) {
+            try {
+                $info = $def.ExtensionData.Info
+                if ($info.Action -and $info.Action.Action) {
+                    foreach ($triggerAction in $info.Action.Action) {
+                        if ($triggerAction.Action -is [VMware.Vim.RunScriptAction]) {
+                            $potentialScript = $triggerAction.Action.Script
+                            if (-not [string]::IsNullOrWhiteSpace($potentialScript)) {
+                                $scriptPath = $potentialScript
+                                $sourceAlarmName = $def.Name
+                                break # Encontramos el script en esta acción, salimos del bucle interior
+                            }
+                        }
                     }
                 }
-            }
-        } catch {}
+            } catch {}
+            
+            if ($scriptPath) { break } # Ya encontramos un script válido, salimos del bucle principal
+        }
 
+        # Validación por si el vCenter no tiene NINGUNA alarma con script
         if ([string]::IsNullOrEmpty($scriptPath)) {
-            $this.alarmCheckReport += [PSCustomObject]@{ vCenter = $vcenterName; Host = $targetName; "Path Alarma" = "N/A"; "Alarma Fuente" = $sourceAlarmName; Result = "La alarma fuente no tiene script configurado"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
+            $this.alarmCheckReport += [PSCustomObject]@{ 
+                vCenter = $vcenterName; Host = $targetName; "Alarm Name" = "N/A"; "Script Path" = "N/A"; Result = "Ninguna alarma en vCenter tiene script configurado"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") 
+            }
             return
         }
 
-        # 4. PREPARAR MÉTRICA (disk.used.latest)
+        # 3. PREPARAR MÉTRICA (disk.used.latest)
         $metricId = $null
         try {
             $perfMgr = Get-View (Get-View ServiceInstance -Server $serverContext).Content.PerfManager -Server $serverContext
@@ -688,11 +696,11 @@ class Proactiva {
             if ($counterInfo) { $metricId = [int]$counterInfo.Key } else { throw "Metric missing" }
         }
         catch {
-            $this.alarmCheckReport += [PSCustomObject]@{ vCenter = $vcenterName; Host = $targetName; "Path Alarma" = $scriptPath; "Alarma Fuente" = $sourceAlarmName; Result = "ERROR API Métrica"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
+            $this.alarmCheckReport += [PSCustomObject]@{ vCenter = $vcenterName; Host = $targetName; "Alarm Name" = $sourceAlarmName; "Script Path" = $scriptPath; Result = "ERROR API Métrica"; Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
             return
         }
 
-        # 5. CREAR Y DISPARAR ALARMA
+        # 4. CREAR Y DISPARAR ALARMA
         try {
             # A. Limpieza preventiva
             $existing = Get-AlarmDefinition -Name $alarmName -Entity $targetDatastore -Server $serverContext -ErrorAction SilentlyContinue
@@ -718,7 +726,7 @@ class Proactiva {
             $spec.Expression = New-Object VMware.Vim.OrAlarmExpression
             $spec.Expression.Expression += $expression
 
-            # D. Acción (Estructura Compleja LucD)
+            # D. Acción (Estructura Compleja)
             $actionGroup = New-Object VMware.Vim.GroupAlarmAction
             $actionTrigger = New-Object VMware.Vim.AlarmTriggeringAction
             
@@ -789,8 +797,8 @@ class Proactiva {
         $this.alarmCheckReport += [PSCustomObject]@{
             vCenter         = $vcenterName
             Host            = $targetName
-            "Alarm Name"   = $sourceAlarmName
-            "Script Path" = $scriptPath
+            "Alarm Name"    = $sourceAlarmName
+            "Script Path"   = $scriptPath
             Result          = $reportResult
             Timestamp       = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
         }
